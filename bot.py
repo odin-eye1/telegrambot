@@ -1,12 +1,13 @@
 import os
 import logging
 from datetime import datetime
+import asyncio
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler
 from telegram.error import BadRequest
 import requests
-from blockchair import Blockchair
+from blockcypher import get_transaction_details, get_address_details
 from nowpayments import NOWPayments
 import json
 
@@ -20,8 +21,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Initialize APIs
-blockchair = Blockchair()
+# Initialize NOWPayments API
 nowpayments = NOWPayments(api_key=os.getenv('NOWPAYMENTS_API_KEY'))
 
 # Store active transactions
@@ -73,6 +73,74 @@ async def check_bot_permissions(update: Update, context: ContextTypes.DEFAULT_TY
         return bot_member.can_restrict_members and bot_member.can_delete_messages
     except BadRequest:
         return False
+
+def detect_crypto_type(address: str) -> str:
+    """Detect if address is BTC or LTC"""
+    if address.startswith('1') or address.startswith('3') or address.startswith('bc1'):
+        return 'btc'
+    elif address.startswith('L') or address.startswith('M') or address.startswith('ltc1'):
+        return 'ltc'
+    else:
+        raise ValueError("Invalid cryptocurrency address")
+
+# Add new transaction monitoring variables
+MONITORING_INTERVAL = 60  # Check every 60 seconds
+monitored_transactions = {}
+
+async def monitor_transaction(chat_id: int, tx_id: str, context: ContextTypes.DEFAULT_TYPE):
+    """Monitor a transaction and send updates"""
+    last_status = None
+    while True:
+        try:
+            # Try BTC first
+            try:
+                tx_info = get_transaction_details(tx_id, coin_symbol='btc')
+                coin_type = 'BTC'
+            except:
+                # If not BTC, try LTC
+                tx_info = get_transaction_details(tx_id, coin_symbol='ltc')
+                coin_type = 'LTC'
+            
+            if tx_info:
+                current_status = "Confirmed" if tx_info.get('confirmations', 0) > 0 else "Pending"
+                amount = tx_info.get('total', 0) / 100000000  # Convert satoshis to BTC/LTC
+                confirmations = tx_info.get('confirmations', 0)
+                
+                # Only send update if status changed
+                if current_status != last_status:
+                    message = f"""
+🔄 Transaction Update
+Status: {current_status}
+Amount: {amount} {coin_type}
+Confirmations: {confirmations}
+                    """
+                    await context.bot.send_message(chat_id=chat_id, text=message)
+                    
+                    # If confirmed, update transaction status
+                    if current_status == "Confirmed" and chat_id in active_transactions:
+                        active_transactions[chat_id]['payment_status'] = 'confirmed'
+                        message = "✅ Payment confirmed! You can now use /release to release the funds."
+                        await context.bot.send_message(chat_id=chat_id, text=message)
+                        # Stop monitoring after confirmation
+                        break
+                
+                last_status = current_status
+            
+            # Wait before next check
+            await asyncio.sleep(MONITORING_INTERVAL)
+            
+        except Exception as e:
+            logger.error(f"Error monitoring transaction: {e}")
+            await asyncio.sleep(MONITORING_INTERVAL)
+
+async def start_monitoring(chat_id: int, tx_id: str, context: ContextTypes.DEFAULT_TYPE):
+    """Start monitoring a transaction"""
+    if chat_id not in monitored_transactions:
+        monitored_transactions[chat_id] = set()
+    
+    if tx_id not in monitored_transactions[chat_id]:
+        monitored_transactions[chat_id].add(tx_id)
+        asyncio.create_task(monitor_transaction(chat_id, tx_id, context))
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle the /start command"""
@@ -182,6 +250,54 @@ Please send the payment to the address above. The bot will monitor the transacti
         logger.error(f"Error creating payment: {e}")
         await update.message.reply_text("Error creating payment request. Please try again later.")
 
+async def check_transaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle the /transaction command"""
+    if update.effective_chat.type == 'group':
+        if not context.args:
+            await update.message.reply_text("Please provide a transaction ID!")
+            return
+        
+        tx_id = context.args[0]
+        chat_id = update.effective_chat.id
+        
+        try:
+            # Start monitoring the transaction
+            await start_monitoring(chat_id, tx_id, context)
+            
+            # Initial check
+            try:
+                tx_info = get_transaction_details(tx_id, coin_symbol='btc')
+                coin_type = 'BTC'
+            except:
+                tx_info = get_transaction_details(tx_id, coin_symbol='ltc')
+                coin_type = 'LTC'
+            
+            if tx_info:
+                status = "Confirmed" if tx_info.get('confirmations', 0) > 0 else "Pending"
+                amount = tx_info.get('total', 0) / 100000000
+                from_address = tx_info.get('inputs', [{}])[0].get('addresses', ['Unknown'])[0]
+                to_address = tx_info.get('outputs', [{}])[0].get('addresses', ['Unknown'])[0]
+                
+                message = f"""
+Transaction Status: {status}
+Amount: {amount} {coin_type}
+From: {from_address}
+To: {to_address}
+Confirmations: {tx_info.get('confirmations', 0)}
+
+I will now monitor this transaction and send updates when the status changes.
+                """
+                
+                await update.message.reply_text(message)
+            else:
+                await update.message.reply_text("Transaction not found!")
+                
+        except Exception as e:
+            logger.error(f"Error checking transaction: {e}")
+            await update.message.reply_text("Error checking transaction status. Please try again later.")
+    else:
+        await update.message.reply_text("This command only works in group chats!")
+
 async def set_buyer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle the /buyer command"""
     if is_blocked(update.effective_user.id):
@@ -197,44 +313,76 @@ async def set_buyer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Please provide a cryptocurrency address!")
             return
         
-        address = context.args[0]
-        chat_id = update.effective_chat.id
-        
-        if chat_id not in active_transactions:
-            active_transactions[chat_id] = {}
-        
-        active_transactions[chat_id]['buyer'] = {
-            'address': address,
-            'user_id': update.effective_user.id,
-            'username': update.effective_user.username,
-            'timestamp': datetime.now().isoformat()
-        }
-        
-        await update.message.reply_text(f"Buyer role set with address: {address}")
+        try:
+            address = context.args[0]
+            coin_type = detect_crypto_type(address)
+            
+            # Verify address is valid
+            address_info = get_address_details(address, coin_symbol=coin_type)
+            if not address_info:
+                await update.message.reply_text("Invalid cryptocurrency address!")
+                return
+            
+            chat_id = update.effective_chat.id
+            if chat_id not in active_transactions:
+                active_transactions[chat_id] = {}
+            
+            active_transactions[chat_id]['buyer'] = {
+                'address': address,
+                'coin_type': coin_type,
+                'timestamp': datetime.now().isoformat()
+            }
+            
+            await update.message.reply_text(f"Buyer role set with {coin_type.upper()} address: {address}")
+        except ValueError as e:
+            await update.message.reply_text(str(e))
+        except Exception as e:
+            logger.error(f"Error setting buyer: {e}")
+            await update.message.reply_text("Error setting buyer address. Please try again later.")
     else:
         await update.message.reply_text("This command only works in group chats!")
 
 async def set_seller(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle the /seller command"""
+    if is_blocked(update.effective_user.id):
+        await update.message.reply_text("You are blocked from using this bot.")
+        return
+
     if update.effective_chat.type == 'group':
+        if not await check_bot_permissions(update, context):
+            await update.message.reply_text("Bot needs admin privileges to function!")
+            return
+
         if not context.args:
             await update.message.reply_text("Please provide a cryptocurrency address!")
             return
         
-        address = context.args[0]
-        chat_id = update.effective_chat.id
-        
-        if chat_id not in active_transactions:
-            active_transactions[chat_id] = {}
-        
-        active_transactions[chat_id]['seller'] = {
-            'address': address,
-            'user_id': update.effective_user.id,
-            'username': update.effective_user.username,
-            'timestamp': datetime.now().isoformat()
-        }
-        
-        await update.message.reply_text(f"Seller role set with address: {address}")
+        try:
+            address = context.args[0]
+            coin_type = detect_crypto_type(address)
+            
+            # Verify address is valid
+            address_info = get_address_details(address, coin_symbol=coin_type)
+            if not address_info:
+                await update.message.reply_text("Invalid cryptocurrency address!")
+                return
+            
+            chat_id = update.effective_chat.id
+            if chat_id not in active_transactions:
+                active_transactions[chat_id] = {}
+            
+            active_transactions[chat_id]['seller'] = {
+                'address': address,
+                'coin_type': coin_type,
+                'timestamp': datetime.now().isoformat()
+            }
+            
+            await update.message.reply_text(f"Seller role set with {coin_type.upper()} address: {address}")
+        except ValueError as e:
+            await update.message.reply_text(str(e))
+        except Exception as e:
+            logger.error(f"Error setting seller: {e}")
+            await update.message.reply_text("Error setting seller address. Please try again later.")
     else:
         await update.message.reply_text("This command only works in group chats!")
 
@@ -305,45 +453,6 @@ The funds will be released to the specified address. The escrow fee ({ESCROW_FEE
     except Exception as e:
         logger.error(f"Error releasing funds: {e}")
         await update.message.reply_text("Error releasing funds. Please try again later.")
-
-async def check_transaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle the /transaction command"""
-    if update.effective_chat.type == 'group':
-        if not context.args:
-            await update.message.reply_text("Please provide a transaction ID!")
-            return
-        
-        tx_id = context.args[0]
-        chat_id = update.effective_chat.id
-        
-        try:
-            # Check transaction status using NOWPayments API
-            payment_status = nowpayments.get_payment_status(tx_id)
-            
-            if payment_status:
-                status = payment_status['payment_status']
-                amount = payment_status['price_amount']
-                currency = payment_status['price_currency']
-                
-                message = f"""
-Transaction Status: {status}
-Amount: {amount} {currency}
-Payment ID: {tx_id}
-                """
-                
-                # Update transaction status if payment is confirmed
-                if chat_id in active_transactions and status == 'confirmed':
-                    active_transactions[chat_id]['payment_status'] = 'confirmed'
-                
-                await update.message.reply_text(message)
-            else:
-                await update.message.reply_text("Transaction not found!")
-                
-        except Exception as e:
-            logger.error(f"Error checking transaction: {e}")
-            await update.message.reply_text("Error checking transaction status. Please try again later.")
-    else:
-        await update.message.reply_text("This command only works in group chats!")
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle the /admin command"""

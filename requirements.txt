@@ -1,0 +1,5 @@
+python-telegram-bot==20.7
+python-dotenv==1.0.0
+requests==2.31.0
+blockchair==0.1.0
+nowpayments-api==1.0.0 

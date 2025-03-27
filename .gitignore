@@ -1,0 +1,5 @@
+.env
+blocked_users.json
+__pycache__/
+*.pyc
+.DS_Store 

@@ -12,6 +12,7 @@ from nowpayments import NOWPayments
 import json
 import traceback
 from typing import Dict, Any
+import time
 
 # Load environment variables
 load_dotenv()
@@ -305,44 +306,101 @@ async def vouches(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("This command is only available in private chat!")
 
 async def create_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Create a payment request using NOWPayments"""
-    chat_id = update.effective_chat.id
-    if chat_id not in active_transactions:
-        await update.message.reply_text("No active transaction found. Please set up buyer and seller first!")
-        return
-
-    transaction = active_transactions[chat_id]
-    if 'amount' not in transaction:
-        await update.message.reply_text("Please specify the amount first!")
-        return
-
+    """Create a payment using NOWPayments API"""
     try:
-        # Create payment request
-        payment = nowpayments.create_payment(
-            price_amount=transaction['amount'],
-            price_currency='usd',
-            order_id=f"escrow_{chat_id}_{datetime.now().timestamp()}",
-            order_description=f"Escrow transaction in chat {chat_id}"
-        )
+        amount = float(context.user_data.get('amount', 0))
+        if amount <= 0:
+            await update.message.reply_text("❌ Invalid amount. Please try again.")
+            return
 
-        # Store payment info
-        transaction['payment_id'] = payment['payment_id']
-        transaction['payment_address'] = payment['pay_address']
-        transaction['payment_status'] = 'pending'
-
-        message = f"""
-Payment Request Created:
-Amount: {transaction['amount']} USD
-Address: {payment['pay_address']}
-Payment ID: {payment['payment_id']}
-
-Please send the payment to the address above. The bot will monitor the transaction and notify when payment is received.
-        """
-        await update.message.reply_text(message)
-
+        # NOWPayments API endpoint
+        url = "https://api.nowpayments.io/v1/payment"
+        
+        # Headers
+        headers = {
+            "x-api-key": os.getenv('NOWPAYMENTS_API_KEY'),
+            "Content-Type": "application/json"
+        }
+        
+        # Request body
+        data = {
+            "price_amount": amount,
+            "price_currency": "usd",
+            "order_id": f"order_{int(time.time())}",
+            "order_description": "Escrow Transaction",
+            "ipn_callback_url": "https://your-domain.com/ipn",  # You'll need to set this up
+            "success_url": "https://t.me/redirectosakura",
+            "cancel_url": "https://t.me/redirectosakura"
+        }
+        
+        # Make the API request
+        response = requests.post(url, headers=headers, json=data)
+        response.raise_for_status()  # Raise an exception for bad status codes
+        
+        result = response.json()
+        
+        if 'payment_url' in result:
+            keyboard = [
+                [InlineKeyboardButton("Pay Now", url=result['payment_url'])]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await update.message.reply_text(
+                f"✅ Payment created successfully!\n\n"
+                f"Amount: ${amount:.2f}\n"
+                f"Payment ID: {result.get('payment_id', 'N/A')}\n"
+                f"Status: {result.get('payment_status', 'pending')}\n\n"
+                f"Click the button below to complete your payment:",
+                reply_markup=reply_markup
+            )
+        else:
+            await update.message.reply_text("❌ Failed to create payment. Please try again.")
+            
+    except requests.exceptions.RequestException as e:
+        logging.error(f"NOWPayments API error: {str(e)}")
+        await update.message.reply_text("❌ Error creating payment. Please try again later.")
     except Exception as e:
-        logger.error(f"Error creating payment: {e}")
-        await update.message.reply_text("Error creating payment request. Please try again later.")
+        logging.error(f"Error in create_payment: {str(e)}")
+        await update.message.reply_text("❌ An unexpected error occurred. Please try again later.")
+
+async def check_payment_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check payment status using NOWPayments API"""
+    try:
+        payment_id = context.user_data.get('payment_id')
+        if not payment_id:
+            await update.message.reply_text("❌ No payment ID found. Please create a payment first.")
+            return
+
+        # NOWPayments API endpoint
+        url = f"https://api.nowpayments.io/v1/payment/{payment_id}"
+        
+        # Headers
+        headers = {
+            "x-api-key": os.getenv('NOWPAYMENTS_API_KEY')
+        }
+        
+        # Make the API request
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        
+        result = response.json()
+        
+        status = result.get('payment_status', 'unknown')
+        amount = result.get('price_amount', 0)
+        currency = result.get('price_currency', 'USD')
+        
+        await update.message.reply_text(
+            f"Payment Status:\n\n"
+            f"Amount: {amount} {currency}\n"
+            f"Status: {status}\n"
+            f"Payment ID: {payment_id}"
+        )
+        
+    except requests.exceptions.RequestException as e:
+        logging.error(f"NOWPayments API error: {str(e)}")
+        await update.message.reply_text("❌ Error checking payment status. Please try again later.")
+    except Exception as e:
+        logging.error(f"Error in check_payment_status: {str(e)}")
+        await update.message.reply_text("❌ An unexpected error occurred. Please try again later.")
 
 async def check_transaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle the /transaction command"""

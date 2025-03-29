@@ -1,17 +1,15 @@
 import os
 import logging
 from datetime import datetime, timedelta
-import asyncio
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler
+from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, MessageHandler, Filters
 from telegram.error import BadRequest, NetworkError, TimedOut, RetryAfter
 import requests
 from blockcypher import get_transaction_details, get_address_details
 from nowpayments import NOWPayments
 import json
 import traceback
-from typing import Dict, Any
 import time
 
 # Load environment variables
@@ -108,7 +106,7 @@ def detect_crypto_type(address: str) -> str:
 MONITORING_INTERVAL = 60  # Check every 60 seconds
 monitored_transactions = {}
 
-async def cleanup_old_transactions(context: ContextTypes.DEFAULT_TYPE):
+def cleanup_old_transactions(context):
     """Clean up old transactions"""
     try:
         current_time = datetime.now()
@@ -126,7 +124,7 @@ async def cleanup_old_transactions(context: ContextTypes.DEFAULT_TYPE):
         for chat_id in expired_chats:
             del active_transactions[chat_id]
             try:
-                await context.bot.send_message(
+                context.bot.send_message(
                     chat_id=chat_id,
                     text="⚠️ Transaction has expired due to inactivity. Please start a new transaction if needed."
                 )
@@ -137,13 +135,7 @@ async def cleanup_old_transactions(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Error during cleanup: {e}")
 
-async def periodic_cleanup(context: ContextTypes.DEFAULT_TYPE):
-    """Run cleanup periodically"""
-    while True:
-        await cleanup_old_transactions(context)
-        await asyncio.sleep(CLEANUP_INTERVAL)
-
-async def handle_api_error(e: Exception, update: Update, context: ContextTypes.DEFAULT_TYPE, operation: str):
+def handle_api_error(e, update, context, operation):
     """Handle API errors and notify appropriate parties"""
     error_message = f"Error during {operation}: {str(e)}"
     logger.error(error_message)
@@ -159,7 +151,7 @@ User: {update.effective_user.id if update.effective_user else 'N/A'}
     """
     
     try:
-        await context.bot.send_message(
+        context.bot.send_message(
             chat_id=ADMIN_GROUP_ID,
             text=admin_message
         )
@@ -169,14 +161,14 @@ User: {update.effective_user.id if update.effective_user else 'N/A'}
     # Notify user if possible
     if update.effective_chat:
         try:
-            await update.message.reply_text(
+            update.message.reply_text(
                 f"Sorry, there was an error during {operation}. "
                 "The admin has been notified and will look into it."
             )
         except Exception as user_error:
             logger.error(f"Error sending user notification: {user_error}")
 
-async def monitor_transaction(chat_id: int, tx_id: str, context: ContextTypes.DEFAULT_TYPE):
+def monitor_transaction(chat_id, tx_id, context):
     """Monitor a transaction and send updates"""
     last_status = None
     retry_count = 0
@@ -208,34 +200,37 @@ Status: {current_status}
 Amount: {amount} {coin_type}
 Confirmations: {confirmations}
                     """
-                    await context.bot.send_message(chat_id=chat_id, text=message)
+                    context.bot.send_message(chat_id=chat_id, text=message)
                     
                     if current_status == "Confirmed" and chat_id in active_transactions:
                         active_transactions[chat_id]['payment_status'] = 'confirmed'
                         message = "✅ Payment confirmed! You can now use /release to release the funds."
-                        await context.bot.send_message(chat_id=chat_id, text=message)
+                        context.bot.send_message(chat_id=chat_id, text=message)
                         break
                 
                 last_status = current_status
                 retry_count = 0  # Reset retry count on successful operation
             
-            await asyncio.sleep(MONITORING_INTERVAL)
+            time.sleep(MONITORING_INTERVAL)
             
         except Exception as e:
             retry_count += 1
             if retry_count >= max_retries:
-                await handle_api_error(e, Update(update_id=0), context, "transaction monitoring")
+                handle_api_error(e, Update(update_id=0), context, "transaction monitoring")
                 break
-            await asyncio.sleep(MONITORING_INTERVAL * retry_count)  # Exponential backoff
+            time.sleep(MONITORING_INTERVAL * retry_count)  # Exponential backoff
 
-async def start_monitoring(chat_id: int, tx_id: str, context: ContextTypes.DEFAULT_TYPE):
+def start_monitoring(chat_id, tx_id, context):
     """Start monitoring a transaction"""
     if chat_id not in monitored_transactions:
         monitored_transactions[chat_id] = set()
     
     if tx_id not in monitored_transactions[chat_id]:
         monitored_transactions[chat_id].add(tx_id)
-        asyncio.create_task(monitor_transaction(chat_id, tx_id, context))
+        import threading
+        thread = threading.Thread(target=monitor_transaction, args=(chat_id, tx_id, context))
+        thread.daemon = True
+        thread.start()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle the /start command"""
@@ -757,30 +752,33 @@ def main():
             logger.error("No bot token found! Please set BOT_TOKEN in .env file")
             return
 
-        # Create application
-        application = Application.builder().token(token).build()
+        # Create updater
+        updater = Updater(token, use_context=True)
+        dispatcher = updater.dispatcher
 
         # Add handlers
-        application.add_handler(CommandHandler("start", start))
-        application.add_handler(CommandHandler("help", help_command))
-        application.add_handler(CommandHandler("links", links))
-        application.add_handler(CommandHandler("vouches", vouches))
-        application.add_handler(CommandHandler("buyer", set_buyer))
-        application.add_handler(CommandHandler("seller", set_seller))
-        application.add_handler(CommandHandler("transaction", check_transaction))
-        application.add_handler(CommandHandler("release", release))
-        application.add_handler(CommandHandler("admin", admin_command))
-        application.add_handler(CommandHandler("block", block_user))
-        application.add_handler(CommandHandler("unblock", unblock_user))
-        application.add_handler(CommandHandler("refund", refund))
-        application.add_handler(CommandHandler("stats", stats))
-        application.add_handler(CallbackQueryHandler(handle_callback))
+        dispatcher.add_handler(CommandHandler("start", start))
+        dispatcher.add_handler(CommandHandler("help", help_command))
+        dispatcher.add_handler(CommandHandler("links", links))
+        dispatcher.add_handler(CommandHandler("vouches", vouches))
+        dispatcher.add_handler(CommandHandler("buyer", set_buyer))
+        dispatcher.add_handler(CommandHandler("seller", set_seller))
+        dispatcher.add_handler(CommandHandler("transaction", check_transaction))
+        dispatcher.add_handler(CommandHandler("release", release))
+        dispatcher.add_handler(CommandHandler("admin", admin_command))
+        dispatcher.add_handler(CommandHandler("block", block_user))
+        dispatcher.add_handler(CommandHandler("unblock", unblock_user))
+        dispatcher.add_handler(CommandHandler("refund", refund))
+        dispatcher.add_handler(CommandHandler("stats", stats))
+        dispatcher.add_handler(CallbackQueryHandler(handle_callback))
 
-        # Start cleanup task
-        application.create_task(periodic_cleanup, application)
+        # Start cleanup job
+        job_queue = updater.job_queue
+        job_queue.run_repeating(cleanup_old_transactions, interval=CLEANUP_INTERVAL)
 
         # Start the bot
-        application.run_polling()
+        updater.start_polling()
+        updater.idle()
 
     except Exception as e:
         logger.error(f"Fatal error in main: {e}")

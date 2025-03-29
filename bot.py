@@ -1,23 +1,29 @@
 import os
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 import asyncio
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler
-from telegram.error import BadRequest
+from telegram.error import BadRequest, NetworkError, TimedOut, RetryAfter
 import requests
 from blockcypher import get_transaction_details, get_address_details
 from nowpayments import NOWPayments
 import json
+import traceback
+from typing import Dict, Any
 
 # Load environment variables
 load_dotenv()
 
-# Configure logging
+# Configure logging with more detailed format
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s - [%(filename)s:%(lineno)d]',
+    level=logging.INFO,
+    handlers=[
+        logging.FileHandler('bot.log'),
+        logging.StreamHandler()
+    ]
 )
 logger = logging.getLogger(__name__)
 
@@ -31,24 +37,34 @@ active_transactions = {}
 BLOCKED_USERS_FILE = 'blocked_users.json'
 blocked_users = set()
 
+# Cleanup settings
+CLEANUP_INTERVAL = 3600  # Clean up every hour
+TRANSACTION_TIMEOUT = 86400  # 24 hours timeout for transactions
+
 def load_blocked_users():
     try:
         with open(BLOCKED_USERS_FILE, 'r') as f:
             return set(json.load(f))
     except FileNotFoundError:
         return set()
+    except json.JSONDecodeError as e:
+        logger.error(f"Error loading blocked users: {e}")
+        return set()
 
 def save_blocked_users():
-    with open(BLOCKED_USERS_FILE, 'w') as f:
-        json.dump(list(blocked_users), f)
+    try:
+        with open(BLOCKED_USERS_FILE, 'w') as f:
+            json.dump(list(blocked_users), f)
+    except Exception as e:
+        logger.error(f"Error saving blocked users: {e}")
 
 # Load blocked users on startup
 blocked_users = load_blocked_users()
 
 # Constants
-OWNER_CHANNEL = "https://t.me/your_owner_channel"
-ADMIN_CHANNEL = "https://t.me/your_admin_channel"
-VOUCH_CHANNEL = "https://t.me/your_vouch_channel"
+OWNER_CHANNEL = "https://t.me/redirectosakura"
+ADMIN_CHANNEL = "https://t.me/redirectosakura"  # Using owner channel for now
+VOUCH_CHANNEL = "https://t.me/redirectosakura"  # Using owner channel for now
 ESCROW_FEE_PERCENTAGE = float(os.getenv('ESCROW_FEE_PERCENTAGE', 5))
 BOT_OWNER_ID = int(os.getenv('BOT_OWNER_ID', 0))
 ADMIN_IDS = [int(id.strip()) for id in os.getenv('ADMIN_IDS', '').split(',') if id.strip()]
@@ -71,7 +87,11 @@ async def check_bot_permissions(update: Update, context: ContextTypes.DEFAULT_TY
     try:
         bot_member = await update.effective_chat.get_member(context.bot.id)
         return bot_member.can_restrict_members and bot_member.can_delete_messages
-    except BadRequest:
+    except BadRequest as e:
+        logger.error(f"Error checking bot permissions: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Unexpected error checking bot permissions: {e}")
         return False
 
 def detect_crypto_type(address: str) -> str:
@@ -87,26 +107,99 @@ def detect_crypto_type(address: str) -> str:
 MONITORING_INTERVAL = 60  # Check every 60 seconds
 monitored_transactions = {}
 
+async def cleanup_old_transactions(context: ContextTypes.DEFAULT_TYPE):
+    """Clean up old transactions"""
+    try:
+        current_time = datetime.now()
+        expired_chats = []
+
+        for chat_id, transaction in active_transactions.items():
+            # Check if transaction is too old
+            if 'timestamp' in transaction:
+                transaction_time = datetime.fromisoformat(transaction['timestamp'])
+                if (current_time - transaction_time).total_seconds() > TRANSACTION_TIMEOUT:
+                    expired_chats.append(chat_id)
+                    logger.info(f"Cleaning up expired transaction in chat {chat_id}")
+
+        # Remove expired transactions
+        for chat_id in expired_chats:
+            del active_transactions[chat_id]
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="⚠️ Transaction has expired due to inactivity. Please start a new transaction if needed."
+                )
+            except Exception as e:
+                logger.error(f"Error sending cleanup message to chat {chat_id}: {e}")
+
+        logger.info(f"Cleanup completed. Removed {len(expired_chats)} expired transactions.")
+    except Exception as e:
+        logger.error(f"Error during cleanup: {e}")
+
+async def periodic_cleanup(context: ContextTypes.DEFAULT_TYPE):
+    """Run cleanup periodically"""
+    while True:
+        await cleanup_old_transactions(context)
+        await asyncio.sleep(CLEANUP_INTERVAL)
+
+async def handle_api_error(e: Exception, update: Update, context: ContextTypes.DEFAULT_TYPE, operation: str):
+    """Handle API errors and notify appropriate parties"""
+    error_message = f"Error during {operation}: {str(e)}"
+    logger.error(error_message)
+    logger.error(traceback.format_exc())
+
+    # Notify admins
+    admin_message = f"""
+🚨 API Error Alert
+Operation: {operation}
+Error: {str(e)}
+Chat ID: {update.effective_chat.id if update.effective_chat else 'N/A'}
+User: {update.effective_user.id if update.effective_user else 'N/A'}
+    """
+    
+    try:
+        await context.bot.send_message(
+            chat_id=ADMIN_GROUP_ID,
+            text=admin_message
+        )
+    except Exception as admin_error:
+        logger.error(f"Error sending admin notification: {admin_error}")
+
+    # Notify user if possible
+    if update.effective_chat:
+        try:
+            await update.message.reply_text(
+                f"Sorry, there was an error during {operation}. "
+                "The admin has been notified and will look into it."
+            )
+        except Exception as user_error:
+            logger.error(f"Error sending user notification: {user_error}")
+
 async def monitor_transaction(chat_id: int, tx_id: str, context: ContextTypes.DEFAULT_TYPE):
     """Monitor a transaction and send updates"""
     last_status = None
+    retry_count = 0
+    max_retries = 3
+
     while True:
         try:
             # Try BTC first
             try:
                 tx_info = get_transaction_details(tx_id, coin_symbol='btc')
                 coin_type = 'BTC'
-            except:
+            except Exception as e:
                 # If not BTC, try LTC
-                tx_info = get_transaction_details(tx_id, coin_symbol='ltc')
-                coin_type = 'LTC'
+                try:
+                    tx_info = get_transaction_details(tx_id, coin_symbol='ltc')
+                    coin_type = 'LTC'
+                except Exception as ltc_error:
+                    raise Exception(f"Failed to get transaction details: {str(e)} | {str(ltc_error)}")
             
             if tx_info:
                 current_status = "Confirmed" if tx_info.get('confirmations', 0) > 0 else "Pending"
-                amount = tx_info.get('total', 0) / 100000000  # Convert satoshis to BTC/LTC
+                amount = tx_info.get('total', 0) / 100000000
                 confirmations = tx_info.get('confirmations', 0)
                 
-                # Only send update if status changed
                 if current_status != last_status:
                     message = f"""
 🔄 Transaction Update
@@ -116,22 +209,23 @@ Confirmations: {confirmations}
                     """
                     await context.bot.send_message(chat_id=chat_id, text=message)
                     
-                    # If confirmed, update transaction status
                     if current_status == "Confirmed" and chat_id in active_transactions:
                         active_transactions[chat_id]['payment_status'] = 'confirmed'
                         message = "✅ Payment confirmed! You can now use /release to release the funds."
                         await context.bot.send_message(chat_id=chat_id, text=message)
-                        # Stop monitoring after confirmation
                         break
                 
                 last_status = current_status
+                retry_count = 0  # Reset retry count on successful operation
             
-            # Wait before next check
             await asyncio.sleep(MONITORING_INTERVAL)
             
         except Exception as e:
-            logger.error(f"Error monitoring transaction: {e}")
-            await asyncio.sleep(MONITORING_INTERVAL)
+            retry_count += 1
+            if retry_count >= max_retries:
+                await handle_api_error(e, Update(update_id=0), context, "transaction monitoring")
+                break
+            await asyncio.sleep(MONITORING_INTERVAL * retry_count)  # Exponential backoff
 
 async def start_monitoring(chat_id: int, tx_id: str, context: ContextTypes.DEFAULT_TYPE):
     """Start monitoring a transaction"""
@@ -598,33 +692,42 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     """Start the bot"""
-    # Get bot token from environment variable
-    token = os.getenv('BOT_TOKEN')
-    if not token:
-        logger.error("No bot token found! Please set BOT_TOKEN in .env file")
-        return
+    try:
+        # Get bot token from environment variable
+        token = os.getenv('BOT_TOKEN')
+        if not token:
+            logger.error("No bot token found! Please set BOT_TOKEN in .env file")
+            return
 
-    # Create application
-    application = Application.builder().token(token).build()
+        # Create application
+        application = Application.builder().token(token).build()
 
-    # Add handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("links", links))
-    application.add_handler(CommandHandler("vouches", vouches))
-    application.add_handler(CommandHandler("buyer", set_buyer))
-    application.add_handler(CommandHandler("seller", set_seller))
-    application.add_handler(CommandHandler("transaction", check_transaction))
-    application.add_handler(CommandHandler("release", release))
-    application.add_handler(CommandHandler("admin", admin_command))
-    application.add_handler(CommandHandler("block", block_user))
-    application.add_handler(CommandHandler("unblock", unblock_user))
-    application.add_handler(CommandHandler("refund", refund))
-    application.add_handler(CommandHandler("stats", stats))
-    application.add_handler(CallbackQueryHandler(handle_callback))
+        # Add handlers
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("help", help_command))
+        application.add_handler(CommandHandler("links", links))
+        application.add_handler(CommandHandler("vouches", vouches))
+        application.add_handler(CommandHandler("buyer", set_buyer))
+        application.add_handler(CommandHandler("seller", set_seller))
+        application.add_handler(CommandHandler("transaction", check_transaction))
+        application.add_handler(CommandHandler("release", release))
+        application.add_handler(CommandHandler("admin", admin_command))
+        application.add_handler(CommandHandler("block", block_user))
+        application.add_handler(CommandHandler("unblock", unblock_user))
+        application.add_handler(CommandHandler("refund", refund))
+        application.add_handler(CommandHandler("stats", stats))
+        application.add_handler(CallbackQueryHandler(handle_callback))
 
-    # Start the bot
-    application.run_polling()
+        # Start cleanup task
+        application.create_task(periodic_cleanup, application)
+
+        # Start the bot
+        application.run_polling()
+
+    except Exception as e:
+        logger.error(f"Fatal error in main: {e}")
+        logger.error(traceback.format_exc())
+        raise
 
 if __name__ == '__main__':
     main() 
